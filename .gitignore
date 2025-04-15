@@ -21,18 +21,20 @@ var/
 *.egg
 
 # PyTorch
-*.pth
-*.pt
+# *.pth  # 保留模型文件
+# *.pt
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
 # Logs
-logs/
+# logs/  # 保留日志目录
 *.log
 
 # VS Code
 .vscode/
 
-# Output folders that might contain large model outputs
-output/
+# 保留输出目录但忽略其中的大文件
+# output/  
+output/*.pth
+output/*.pt
