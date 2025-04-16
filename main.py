@@ -56,6 +56,8 @@ elif config.fuse_model_type == 'OTE' or config.fuse_model_type == 'OutputTransfo
     from Models.OTEModel import Model
 elif config.fuse_model_type == 'NaiveCat':
     from Models.NaiveCatModel import Model
+elif config.fuse_model_type == 'MCT' or config.fuse_model_type == 'MultiheadCrossTransformer':
+    from Models.MCTModel import Model
 else:
     from Models.NaiveCombineModel import Model
 model = Model(config)
