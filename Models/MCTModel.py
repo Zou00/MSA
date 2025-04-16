@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel
 from torchvision.models import resnet50
 
@@ -11,18 +12,22 @@ class TextModel(nn.Module):
 
         self.bert = AutoModel.from_pretrained(config.bert_name)
         self.trans = nn.Sequential(
-            nn.LayerNorm(self.bert.config.hidden_size),  # 添加层归一化
-            nn.Dropout(config.bert_dropout),
+            nn.LayerNorm(self.bert.config.hidden_size),  
+            nn.Dropout(config.bert_dropout * 1.2),  # 增加dropout比例
             nn.Linear(self.bert.config.hidden_size, config.middle_hidden_size),
-            nn.GELU(),  # 使用 GELU 激活函数代替 ReLU
+            nn.GELU(),
         ) 
         
-        # 是否进行fine-tune
-        for param in self.bert.parameters():
+        # 只微调BERT的最后几层，前面的层冻结
+        for i, param in enumerate(self.bert.parameters()):
             if config.fixed_text_model_params:
                 param.requires_grad = False
             else:
-                param.requires_grad = True
+                # 只微调最后4层
+                if i >= len(list(self.bert.parameters())) - 40:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
 
     def forward(self, bert_inputs, masks, token_type_ids=None):
         bert_out = self.bert(input_ids=bert_inputs, token_type_ids=token_type_ids, attention_mask=masks)
@@ -46,33 +51,26 @@ class ImageModel(nn.Module):
             nn.Flatten()
         )
 
-        # 获取特征响应图: (batch, 2048, 7, 7) -> (batch, img_hidden_seq, middle_hidden_size)
+        # 获取特征响应图
         self.hidden_trans = nn.Sequential(
-            nn.BatchNorm2d(self.full_resnet.fc.in_features),  # 添加批归一化
+            nn.BatchNorm2d(self.full_resnet.fc.in_features),
             nn.Conv2d(self.full_resnet.fc.in_features, config.img_hidden_seq, 1),
             nn.Flatten(start_dim=2),
-            nn.Dropout(config.resnet_dropout),
+            nn.Dropout(config.resnet_dropout * 1.2),  # 增加dropout比例
             nn.Linear(7 * 7, config.middle_hidden_size),
-            nn.GELU(),  # 使用 GELU 激活函数
+            nn.GELU(),
         )
 
         self.trans = nn.Sequential(
-            nn.LayerNorm(self.full_resnet.fc.in_features),  # 添加层归一化
-            nn.Dropout(config.resnet_dropout),
+            nn.LayerNorm(self.full_resnet.fc.in_features),
+            nn.Dropout(config.resnet_dropout * 1.2),  # 增加dropout比例
             nn.Linear(self.full_resnet.fc.in_features, config.middle_hidden_size),
-            nn.GELU(),  # 使用 GELU 激活函数
+            nn.GELU(),
         )
         
-        # 是否进行fine-tune - 只微调后面几层，减少过拟合
-        for i, param in enumerate(self.full_resnet.parameters()):
-            if config.fixed_image_model_params:
-                param.requires_grad = False
-            else:
-                # 只微调后面几层
-                if i > len(list(self.full_resnet.parameters())) - 30:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+        # 完全冻结ResNet所有参数
+        for param in self.full_resnet.parameters():
+            param.requires_grad = False
 
     def forward(self, imgs):
         hidden_state = self.resnet_h(imgs)
@@ -81,142 +79,189 @@ class ImageModel(nn.Module):
         return self.hidden_trans(hidden_state), self.trans(feature)
 
 
-class GradualMultiHeadCrossAttention(nn.Module):
-    """改进的多头交叉注意力层"""
-    def __init__(self, config):
-        super(GradualMultiHeadCrossAttention, self).__init__()
-        # 减少注意力头的数量以降低模型复杂度
-        self.attention_nhead = max(4, config.attention_nhead // 2)
+class AttentionPooling(nn.Module):
+    """注意力加权池化层"""
+    def __init__(self, hidden_size):
+        super(AttentionPooling, self).__init__()
+        self.query = nn.Parameter(torch.randn(hidden_size))
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
         
-        # 文本到图像的注意力
+    def forward(self, hidden_states):
+        # hidden_states: [batch_size, seq_len, hidden_size]
+        key = self.key_proj(hidden_states)
+        
+        # 计算注意力分数
+        scores = torch.matmul(key, self.query) / (self.query.norm() * key.norm(dim=-1) + 1e-8)
+        
+        # 应用softmax获取权重
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)
+        
+        # 加权sum
+        pooled = torch.sum(hidden_states * weights, dim=1)
+        
+        return pooled
+
+
+class LightWeightCrossAttention(nn.Module):
+    """轻量级多头交叉注意力层"""
+    def __init__(self, config):
+        super(LightWeightCrossAttention, self).__init__()
+        # 降低复杂度
+        self.attention_nhead = 4
+        
+        # 降维投影 - 减少计算量
+        self.dim_reduction = config.middle_hidden_size // 2
+        
+        # 投影层
+        self.text_proj = nn.Linear(config.middle_hidden_size, self.dim_reduction)
+        self.img_proj = nn.Linear(config.middle_hidden_size, self.dim_reduction)
+        
+        # 注意力层
         self.text_to_img_attention = nn.MultiheadAttention(
-            embed_dim=config.middle_hidden_size,
+            embed_dim=self.dim_reduction,
             num_heads=self.attention_nhead, 
-            dropout=config.attention_dropout,
+            dropout=0.1,
             batch_first=True
         )
         self.img_to_text_attention = nn.MultiheadAttention(
-            embed_dim=config.middle_hidden_size,
+            embed_dim=self.dim_reduction,
             num_heads=self.attention_nhead, 
-            dropout=config.attention_dropout,
+            dropout=0.1,
             batch_first=True
         )
         
         # 层归一化
-        self.norm_text1 = nn.LayerNorm(config.middle_hidden_size)
-        self.norm_text2 = nn.LayerNorm(config.middle_hidden_size)
-        self.norm_img1 = nn.LayerNorm(config.middle_hidden_size)
-        self.norm_img2 = nn.LayerNorm(config.middle_hidden_size)
+        self.norm_text1 = nn.LayerNorm(self.dim_reduction)
+        self.norm_text2 = nn.LayerNorm(self.dim_reduction)
+        self.norm_img1 = nn.LayerNorm(self.dim_reduction)
+        self.norm_img2 = nn.LayerNorm(self.dim_reduction)
         
-        # 前馈网络 - 使用更小的维度扩展
-        self.feedforward_text = nn.Sequential(
-            nn.Linear(config.middle_hidden_size, config.middle_hidden_size * 2),
+        # 简化的前馈网络
+        self.feedforward = nn.Sequential(
+            nn.Linear(self.dim_reduction, self.dim_reduction),
             nn.GELU(),
-            nn.Dropout(config.attention_dropout),
-            nn.Linear(config.middle_hidden_size * 2, config.middle_hidden_size)
+            nn.Dropout(0.2),
+            nn.Linear(self.dim_reduction, self.dim_reduction)
         )
         
-        self.feedforward_img = nn.Sequential(
-            nn.Linear(config.middle_hidden_size, config.middle_hidden_size * 2),
-            nn.GELU(),
-            nn.Dropout(config.attention_dropout),
-            nn.Linear(config.middle_hidden_size * 2, config.middle_hidden_size)
-        )
+        # 池化层
+        self.text_pool = AttentionPooling(self.dim_reduction)
+        self.img_pool = AttentionPooling(self.dim_reduction)
         
-        # 特征融合 - 使用门控机制
-        self.text_gate = nn.Sequential(
-            nn.Linear(config.middle_hidden_size, 1),
-            nn.Sigmoid()
-        )
-        self.img_gate = nn.Sequential(
-            nn.Linear(config.middle_hidden_size, 1),
-            nn.Sigmoid()
-        )
-        
-        # 最终融合
-        self.fusion = nn.Sequential(
-            nn.Linear(config.middle_hidden_size * 2, config.middle_hidden_size),
-            nn.LayerNorm(config.middle_hidden_size),
-            nn.Dropout(min(0.1, config.fuse_dropout / 2)),  # 减少 dropout 比例
-            nn.GELU()
-        )
+        # 投影回原始维度
+        self.out_proj = nn.Linear(self.dim_reduction * 2, config.middle_hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        self.norm_out = nn.LayerNorm(config.middle_hidden_size)
         
     def forward(self, text_hidden, img_hidden):
+        # 降维处理
+        text_reduced = self.text_proj(text_hidden)
+        img_reduced = self.img_proj(img_hidden)
+        
         # 文本到图像的注意力
         text_img_attn, _ = self.text_to_img_attention(
-            query=text_hidden,
-            key=img_hidden,
-            value=img_hidden
+            query=text_reduced,
+            key=img_reduced,
+            value=img_reduced
         )
-        text_residual = self.norm_text1(text_hidden + text_img_attn)
-        text_output = self.norm_text2(text_residual + self.feedforward_text(text_residual))
+        text_residual = self.norm_text1(text_reduced + text_img_attn)
+        text_output = self.norm_text2(text_residual + self.feedforward(text_residual))
         
         # 图像到文本的注意力
         img_text_attn, _ = self.img_to_text_attention(
-            query=img_hidden,
-            key=text_hidden,
-            value=text_hidden
+            query=img_reduced,
+            key=text_reduced,
+            value=text_reduced
         )
-        img_residual = self.norm_img1(img_hidden + img_text_attn)
-        img_output = self.norm_img2(img_residual + self.feedforward_img(img_residual))
+        img_residual = self.norm_img1(img_reduced + img_text_attn)
+        img_output = self.norm_img2(img_residual + self.feedforward(img_residual))
         
-        # 使用加权池化获取特征表示
-        text_weights = self.text_gate(text_output)
-        img_weights = self.img_gate(img_output)
+        # 注意力池化
+        text_feature = self.text_pool(text_output)
+        img_feature = self.img_pool(img_output)
         
-        text_feature = (text_output * text_weights).sum(dim=1) / (text_weights.sum(dim=1) + 1e-8)
-        img_feature = (img_output * img_weights).sum(dim=1) / (img_weights.sum(dim=1) + 1e-8)
-        
-        # 特征融合
+        # 特征融合并投影回原始维度
         combined = torch.cat([text_feature, img_feature], dim=1)
-        fused = self.fusion(combined)
+        fused = self.dropout(self.out_proj(combined))
+        fused = self.norm_out(fused)
         
         return text_output, img_output, fused
 
 
-class EfficientTransformerFusion(nn.Module):
-    """更高效的Transformer融合层"""
+class SimplifiedTransformerFusion(nn.Module):
+    """简化版的Transformer融合层"""
     def __init__(self, config):
-        super(EfficientTransformerFusion, self).__init__()
-        # 减少Transformer层数
-        self.num_layers = 1
+        super(SimplifiedTransformerFusion, self).__init__()
+        # 降低复杂度，只用一层
+        self.dim_reduction = config.middle_hidden_size // 2
         
-        # 使用更高效的Transformer配置
-        self.transformer_layer = nn.TransformerEncoderLayer(
-            d_model=config.middle_hidden_size,
-            nhead=max(4, config.attention_nhead // 2),  # 减少注意力头数
-            dropout=min(0.1, config.attention_dropout / 2),  # 降低dropout比例
-            dim_feedforward=config.middle_hidden_size * 2,  # 减小前馈网络维度
-            batch_first=True,
-            activation='gelu'  # 使用GELU激活函数
-        )
-        self.transformer = nn.TransformerEncoder(
-            self.transformer_layer,
-            num_layers=self.num_layers
+        # 投影层
+        self.proj = nn.Linear(config.middle_hidden_size, self.dim_reduction)
+        
+        # 简化的自注意力层
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=self.dim_reduction,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True
         )
         
-        # 添加辅助分类器 - 帮助特征学习
-        self.aux_classifier = nn.Sequential(
-            nn.Linear(config.middle_hidden_size, config.num_labels),
-            nn.LogSoftmax(dim=-1)
+        # 层归一化
+        self.norm1 = nn.LayerNorm(self.dim_reduction)
+        self.norm2 = nn.LayerNorm(self.dim_reduction)
+        
+        # 简化的前馈网络
+        self.feedforward = nn.Sequential(
+            nn.Linear(self.dim_reduction, self.dim_reduction),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.dim_reduction, self.dim_reduction)
         )
+        
+        # 池化层
+        self.pool = AttentionPooling(self.dim_reduction)
+        
+        # 输出层
+        self.output_proj = nn.Linear(self.dim_reduction, config.middle_hidden_size)
         
     def forward(self, text_features, img_features):
-        # 将文本和图像特征序列拼接
-        combined = torch.cat([text_features, img_features], dim=1)
+        # 投影降维
+        text_reduced = self.proj(text_features)
+        img_reduced = self.proj(img_features)
         
-        # 通过Transformer处理
-        output = self.transformer(combined)
+        # 合并特征
+        combined = torch.cat([text_reduced, img_reduced], dim=1)
         
-        # 使用注意力池化
-        avg_pooled = torch.mean(output, dim=1)
-        max_pooled, _ = torch.max(output, dim=1)
-        fused_feature = avg_pooled + max_pooled  # 结合平均池化和最大池化
+        # 自注意力处理
+        attn_output, _ = self.self_attention(combined, combined, combined)
+        residual = self.norm1(combined + attn_output)
+        output = self.norm2(residual + self.feedforward(residual))
         
-        # 辅助分类器输出 (训练时可用于辅助损失)
-        aux_logits = self.aux_classifier(fused_feature)
+        # 池化并投影回原始维度
+        pooled = self.pool(output)
+        final_output = self.output_proj(pooled)
         
-        return fused_feature, aux_logits
+        return final_output
+
+
+class WeightedEnsemble(nn.Module):
+    """权重融合不同特征的集成模块"""
+    def __init__(self, hidden_size, num_features=3):
+        super(WeightedEnsemble, self).__init__()
+        self.feature_weights = nn.Parameter(torch.ones(num_features) / num_features)
+        self.scale_proj = nn.Linear(hidden_size * num_features, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        
+    def forward(self, *features):
+        # 应用特征权重
+        weighted_features = [w * f for w, f in zip(F.softmax(self.feature_weights, dim=0), features)]
+        
+        # 合并特征
+        concat_features = torch.cat(weighted_features, dim=1)
+        output = self.scale_proj(concat_features)
+        output = self.norm(output)
+        
+        return output
 
 
 class Model(nn.Module):
@@ -227,38 +272,31 @@ class Model(nn.Module):
         # 图像模型
         self.img_model = ImageModel(config)
         
-        # 改进的多头交叉注意力层
-        self.cross_attention = GradualMultiHeadCrossAttention(config)
+        # 轻量级交叉注意力
+        self.cross_attention = LightWeightCrossAttention(config)
         
-        # 高效Transformer融合层
-        self.transformer_fusion = EfficientTransformerFusion(config)
+        # 简化的Transformer融合
+        self.transformer_fusion = SimplifiedTransformerFusion(config)
         
-        # 残差连接
-        self.use_residual = True
-        
-        # 特征融合层
-        self.feature_fusion = nn.Sequential(
-            nn.Linear(config.middle_hidden_size * 3, config.out_hidden_size),
-            nn.LayerNorm(config.out_hidden_size),
-            nn.Dropout(min(0.2, config.fuse_dropout)),
-            nn.GELU()
-        )
+        # 特征集成
+        self.feature_ensemble = WeightedEnsemble(config.middle_hidden_size)
         
         # 分类器
         self.classifier = nn.Sequential(
+            nn.Linear(config.middle_hidden_size, config.out_hidden_size),
+            nn.LayerNorm(config.out_hidden_size),
+            nn.Dropout(0.2),
+            nn.GELU(),
             nn.Linear(config.out_hidden_size, config.num_labels)
         )
         
         # 使用标签平滑的交叉熵损失，缓解过拟合
-        self.label_smoothing = 0.1
+        self.label_smoothing = 0.2  # 增加标签平滑
         self.loss_func = nn.CrossEntropyLoss(
             label_smoothing=self.label_smoothing,
             weight=torch.tensor(config.loss_weight) if hasattr(config, 'loss_weight') and config.loss_weight else None
         )
         
-        # 辅助损失权重
-        self.aux_loss_weight = 0.2
-
     def forward(self, texts, texts_mask, imgs, labels=None):
         # 获取文本特征
         text_hidden_state, text_pooled = self.text_model(texts, texts_mask)
@@ -266,35 +304,35 @@ class Model(nn.Module):
         # 获取图像特征
         img_hidden_state, img_pooled = self.img_model(imgs)
         
-        # 使用改进的多头交叉注意力处理
-        text_refined, img_refined, cross_features = self.cross_attention(text_hidden_state, img_hidden_state)
+        # 使用轻量级交叉注意力处理
+        _, _, cross_features = self.cross_attention(text_hidden_state, img_hidden_state)
         
-        # 使用高效Transformer进一步融合特征
-        transformer_features, aux_logits = self.transformer_fusion(text_refined, img_refined)
+        # 使用简化的Transformer融合特征
+        transformer_features = self.transformer_fusion(text_hidden_state, img_hidden_state)
         
-        # 残差连接: 加入原始pooled特征
-        if self.use_residual:
-            final_features = torch.cat([cross_features, transformer_features, text_pooled + img_pooled], dim=1)
-        else:
-            final_features = torch.cat([cross_features, transformer_features, torch.zeros_like(text_pooled)], dim=1)
-        
-        # 特征融合
-        fused_features = self.feature_fusion(final_features)
+        # 集成原始池化特征和增强特征
+        fused_features = self.feature_ensemble(cross_features, transformer_features, text_pooled * 0.7 + img_pooled * 0.3)
         
         # 分类
         logits = self.classifier(fused_features)
-        prob_vec = torch.softmax(logits, dim=1)
+        
+        # 应用温度缩放使预测更加平滑
+        temperature = 1.2
+        scaled_logits = logits / temperature
+        
+        prob_vec = torch.softmax(scaled_logits, dim=1)
         pred_labels = torch.argmax(prob_vec, dim=1)
 
         if labels is not None:
-            # 主损失
-            main_loss = self.loss_func(logits, labels)
+            # 计算损失，包括权重衰减以减轻过拟合
+            loss = self.loss_func(scaled_logits, labels)
             
-            # 辅助损失
-            aux_loss = nn.functional.nll_loss(aux_logits, labels)
-            
-            # 总损失 = 主损失 + 辅助损失*权重
-            loss = main_loss + self.aux_loss_weight * aux_loss
+            # 添加L2正则化
+            l2_lambda = 1e-4
+            l2_reg = 0.
+            for param in self.parameters():
+                l2_reg += torch.norm(param, 2)
+            loss += l2_lambda * l2_reg
             
             return pred_labels, loss
         else:
